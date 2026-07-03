@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>老式电视机原理可视化</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene"></canvas>
+      <div class="topbar">
+        <div class="brand">
+          <span class="status-dot"></span>
+          <div>
+            <h1>老式电视机原理可视化</h1>
+            <p>CRT 电子束扫描、偏转线圈、荧光屏成像</p>
+          </div>
+        </div>
+        <div class="toolbar" aria-label="视图工具">
+          <button id="playToggle" class="icon-button" type="button" title="暂停/播放动画" aria-label="暂停/播放动画"></button>
+          <button id="resetView" class="icon-button" type="button" title="重置视角" aria-label="重置视角"></button>
+        </div>
+      </div>
+      <aside class="control-panel" aria-label="电视机原理控制台">
+        <section>
+          <h2>观察模式</h2>
+          <div class="segmented" role="group" aria-label="观察模式">
+            <button class="mode-button" type="button" data-mode="overview">整体</button>
+            <button class="mode-button" type="button" data-mode="inside">剖视</button>
+            <button class="mode-button is-active" type="button" data-mode="signal">信号</button>
+            <button class="mode-button" type="button" data-mode="screen">屏幕</button>
+          </div>
+        </section>
+        <section class="signal-scope">
+          <h2>信号到画面</h2>
+          <div class="scope-row">
+            <span>RF 载波</span>
+            <canvas id="rfScope" width="230" height="46"></canvas>
+          </div>
+          <div class="scope-row">
+            <span>解调视频</span>
+            <canvas id="videoScope" width="230" height="46"></canvas>
+          </div>
+          <div class="scope-row">
+            <span>同步脉冲</span>
+            <canvas id="syncScope" width="230" height="34"></canvas>
+          </div>
+          <div class="scope-row">
+            <span>当前扫描线</span>
+            <canvas id="lineScope" width="230" height="46"></canvas>
+          </div>
+          <div class="scope-row preview-row">
+            <span>屏幕画面</span>
+            <canvas id="screenScope" width="230" height="84"></canvas>
+          </div>
+        </section>
+        <section>
+          <h2>工作部件</h2>
+          <label class="switch-row">
+            <span>外壳透明</span>
+            <input id="shellTransparent" type="checkbox" checked />
+          </label>
+          <label class="switch-row">
+            <span>电子束</span>
+            <input id="beamVisible" type="checkbox" checked />
+          </label>
+          <label class="switch-row">
+            <span>偏转线圈</span>
+            <input id="coilVisible" type="checkbox" checked />
+          </label>
+          <label class="switch-row">
+            <span>信号流程</span>
+            <input id="signalVisible" type="checkbox" checked />
+          </label>
+        </section>
+        <section>
+          <h2>扫描参数</h2>
+          <label class="range-row">
+            <span>扫描速度</span>
+            <input id="scanSpeed" type="range" min="0.5" max="2.5" step="0.05" value="1.15" />
+          </label>
+          <label class="range-row">
+            <span>亮度</span>
+            <input id="brightness" type="range" min="0.35" max="1.35" step="0.05" value="0.95" />
+          </label>
+          <label class="range-row">
+            <span>信号噪声</span>
+            <input id="noise" type="range" min="0" max="0.55" step="0.01" value="0.12" />
+          </label>
+        </section>
+        <section class="readout">
+          <h2>当前过程</h2>
+          <div class="conversion-steps" aria-label="信号转换步骤">
+            <div class="step is-active" data-step="receive"><b>1</b><span>天线接收</span></div>
+            <div class="step" data-step="demod"><b>2</b><span>调谐解调</span></div>
+            <div class="step" data-step="video"><b>3</b><span>视频亮度</span></div>
+            <div class="step" data-step="sync"><b>4</b><span>同步偏转</span></div>
+            <div class="step" data-step="paint"><b>5</b><span>逐点成像</span></div>
+          </div>
+          <div class="meter">
+            <span>水平扫描</span>
+            <div><i id="horizontalMeter"></i></div>
+          </div>
+          <div class="meter">
+            <span>垂直扫描</span>
+            <div><i id="verticalMeter"></i></div>
+          </div>
+          <div class="meter">
+            <span>视频亮度</span>
+            <div><i id="videoMeter"></i></div>
+          </div>
+          <p id="explainText">天线先接收高频载波，调谐电路选出台信号并解调出视频亮度；同步脉冲控制偏转线圈，亮度信号控制电子束强弱，逐点写成屏幕画面。</p>
+        </section>
+      </aside>
+      <div id="labels" class="labels" aria-hidden="true"></div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
