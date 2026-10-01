@@ -1,8 +1,19 @@
 import './styles.css';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { createElement, icons } from 'lucide';
+import { CAB, GUN, PCB, RASTER, SX, SY, YOKE, faceZ } from './model/dims.js';
+import { createMaterials } from './model/materials.js';
+import { buildCabinet, PANEL_LAYOUT } from './model/cabinet.js';
+import { buildCRT } from './model/crt.js';
+import { buildChassis } from './model/chassis.js';
+import { buildStage } from './model/stage.js';
+import { smoothstep } from './model/utils.js';
+import { createTestCard } from './testcard.js';
 
 const canvas = document.querySelector('#scene');
 const renderer = new THREE.WebGLRenderer({
@@ -11,35 +22,48 @@ const renderer = new THREE.WebGLRenderer({
   alpha: false,
   preserveDrawingBuffer: true,
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+const pixelRatio = Math.min(window.devicePixelRatio, 2);
+renderer.setPixelRatio(pixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.12;
+renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.localClippingEnabled = true;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x071013);
-scene.fog = new THREE.Fog(0x071013, 16, 38);
-
-const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
-camera.position.set(6.6, 3.3, 7.8);
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.05, 120);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 0.6, 0);
 controls.enableDamping = true;
-controls.maxDistance = 16;
-controls.minDistance = 4.5;
-controls.maxPolarAngle = Math.PI * 0.48;
+controls.maxDistance = 18;
+controls.minDistance = 2.2;
+controls.maxPolarAngle = Math.PI * 0.49;
+
+const composerTarget = new THREE.WebGLRenderTarget(
+  window.innerWidth * pixelRatio,
+  window.innerHeight * pixelRatio,
+  { type: THREE.HalfFloatType, samples: 4 },
+);
+const composer = new EffectComposer(renderer, composerTarget);
+composer.setPixelRatio(pixelRatio);
+composer.setSize(window.innerWidth, window.innerHeight);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.32, 0.45, 0.92);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
 
 const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
+const pointer = new THREE.Vector2(-10, -10);
+const pointerClient = { x: 0, y: 0, moved: false };
 const labelLayer = document.querySelector('#labels');
 const labels = [];
 
 const state = {
   paused: false,
   mode: 'signal',
-  shellTransparent: true,
+  shellOpen: true,
   beamVisible: true,
   coilVisible: true,
   signalVisible: true,
@@ -47,346 +71,157 @@ const state = {
   brightness: 0.95,
   noise: 0.12,
   scan: 0,
+  open: 1,
 };
+
+// 剖切：两张平面取交集，切掉 x > CUT_X 且 y > CUT_Y 的右上象限
+const CUT_X = SX;
+const CUT_Y = SY;
+const CUT_FAR = 6;
+const cutPlanes = [
+  new THREE.Plane(new THREE.Vector3(-1, 0, 0), CUT_FAR),
+  new THREE.Plane(new THREE.Vector3(0, -1, 0), CUT_FAR),
+];
+
+const testCard = createTestCard();
+const sampleVideoSignal = (u, v) => clamp(testCard.sample(u, v), 0.04, 1);
+
+const materials = createMaterials(cutPlanes);
+const screenTexture = createScreenTexture();
+materials.screen.emissiveMap = screenTexture.texture;
+materials.screen.needsUpdate = true;
+const scopes = createScopes();
+
+const stage = buildStage(scene, renderer);
 
 const groups = {
   television: new THREE.Group(),
-  internals: new THREE.Group(),
-  coils: new THREE.Group(),
   signals: new THREE.Group(),
   beam: new THREE.Group(),
-  labels: new THREE.Group(),
 };
+scene.add(groups.television, groups.signals);
 
-scene.add(groups.television, groups.internals, groups.signals);
-groups.internals.add(groups.coils, groups.beam);
+const cabinet = buildCabinet(materials, cutPlanes);
+const crt = buildCRT(materials);
+const chassis = buildChassis(materials, crt.parts.anodeAnchor);
+groups.television.add(cabinet.group, crt.group, chassis.group);
+crt.group.add(groups.beam);
 
-const shellMaterial = new THREE.MeshStandardMaterial({
-  color: 0x263236,
-  roughness: 0.72,
-  metalness: 0.05,
-  transparent: true,
-  opacity: 0.46,
-});
+configureShadows(groups.television);
+const pickables = registerParts();
 
-const trimMaterial = new THREE.MeshStandardMaterial({
-  color: 0xd6d0bd,
-  roughness: 0.58,
-  metalness: 0.12,
-});
-
-const darkMaterial = new THREE.MeshStandardMaterial({
-  color: 0x0d1315,
-  roughness: 0.88,
-});
-
-const brassMaterial = new THREE.MeshStandardMaterial({
-  color: 0xc89447,
-  roughness: 0.42,
-  metalness: 0.55,
-});
-
-const glassMaterial = new THREE.MeshPhysicalMaterial({
-  color: 0x8fffd1,
-  roughness: 0.05,
-  metalness: 0,
-  transmission: 0.38,
-  thickness: 0.22,
-  transparent: true,
-  opacity: 0.44,
-  emissive: 0x154b35,
-  emissiveIntensity: 0.2,
-});
-
-const phosphorMaterial = new THREE.MeshBasicMaterial({
-  color: 0x88ffc8,
-  transparent: true,
-  opacity: 1,
-});
-
-const copperMaterial = new THREE.MeshStandardMaterial({
-  color: 0xc0773a,
-  roughness: 0.32,
-  metalness: 0.45,
-  emissive: 0x241008,
-});
-
-const redBeamMaterial = new THREE.LineBasicMaterial({
-  color: 0xff705d,
-  transparent: true,
-  opacity: 0.95,
-  blending: THREE.AdditiveBlending,
-});
-
-const cyanMaterial = new THREE.MeshBasicMaterial({
-  color: 0x66d8f0,
-  transparent: true,
-  opacity: 0.72,
-});
-
-const amberMaterial = new THREE.MeshBasicMaterial({
-  color: 0xf2b15e,
-  transparent: true,
-  opacity: 0.78,
-});
-
-const screenTexture = createScreenTexture();
-const scopes = createScopes();
-
-buildLights();
-buildRoom();
-buildTelevision();
-buildInternals();
 buildSignalFlow();
 buildLabels();
 buildUI();
 
 const clock = new THREE.Clock();
-let beamLine;
-let beamGlow;
-let scanSpot;
-let hovered = null;
+const beam = createBeamObjects();
+const meters = {
+  horizontal: document.querySelector('#horizontalMeter'),
+  vertical: document.querySelector('#verticalMeter'),
+  video: document.querySelector('#videoMeter'),
+};
+const tooltip = createTooltip();
+let frame = 0;
 
-createBeamObjects();
-setMode('signal', true);
-applyVisibility();
-
-function buildLights() {
-  scene.add(new THREE.HemisphereLight(0xb9fff0, 0x111315, 1.1));
-
-  const key = new THREE.DirectionalLight(0xffffff, 2.6);
-  key.position.set(5, 7, 4);
-  scene.add(key);
-
-  const rim = new THREE.PointLight(0x66d8f0, 12, 14);
-  rim.position.set(-4.6, 2.2, -3.5);
-  scene.add(rim);
-
-  const screenGlow = new THREE.PointLight(0x73f6b4, 5.5, 8);
-  screenGlow.position.set(0, 0.8, 2.2);
-  scene.add(screenGlow);
-}
-
-function buildRoom() {
-  const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(28, 28),
-    new THREE.MeshStandardMaterial({
-      color: 0x11191b,
-      roughness: 0.84,
-      metalness: 0.02,
-    }),
-  );
-  floor.rotation.x = -Math.PI / 2;
-  floor.position.y = -1.45;
-  scene.add(floor);
-
-  const grid = new THREE.GridHelper(24, 24, 0x315055, 0x172326);
-  grid.position.y = -1.435;
-  grid.material.transparent = true;
-  grid.material.opacity = 0.28;
-  scene.add(grid);
-}
-
-function buildTelevision() {
-  const cabinet = new THREE.Mesh(new RoundedBoxGeometry(4.6, 3.15, 2.6, 7, 0.22), shellMaterial);
-  cabinet.position.set(0, 0.15, 0);
-  cabinet.name = '外壳';
-  groups.television.add(cabinet);
-
-  const face = new THREE.Mesh(new RoundedBoxGeometry(4.78, 3.28, 0.34, 6, 0.18), trimMaterial);
-  face.position.set(0, 0.15, 1.32);
-  groups.television.add(face);
-
-  const screenFrame = new THREE.Mesh(new RoundedBoxGeometry(3.18, 2.28, 0.18, 6, 0.15), darkMaterial);
-  screenFrame.position.set(-0.45, 0.28, 1.53);
-  groups.television.add(screenFrame);
-
-  const screen = new THREE.Mesh(new RoundedBoxGeometry(2.78, 1.88, 0.08, 8, 0.12), phosphorMaterial);
-  screen.position.set(-0.45, 0.28, 1.64);
-  screen.material.map = screenTexture.texture;
-  screen.material.needsUpdate = true;
-  groups.television.add(screen);
-
-  const glass = new THREE.Mesh(new RoundedBoxGeometry(2.92, 2.02, 0.06, 8, 0.13), glassMaterial);
-  glass.position.set(-0.45, 0.28, 1.69);
-  groups.television.add(glass);
-
-  const speaker = new THREE.Group();
-  for (let i = 0; i < 9; i += 1) {
-    const y = -0.55 + i * 0.14;
-    const slot = new THREE.Mesh(new RoundedBoxGeometry(0.7, 0.045, 0.08, 3, 0.02), darkMaterial);
-    slot.position.set(1.58, y, 1.56);
-    speaker.add(slot);
-  }
-  groups.television.add(speaker);
-
-  for (let i = 0; i < 2; i += 1) {
-    const knob = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.16, 32), brassMaterial);
-    knob.rotation.x = Math.PI / 2;
-    knob.position.set(1.56, 0.82 - i * 0.58, 1.66);
-    groups.television.add(knob);
-
-    const indicator = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.15, 0.025), darkMaterial);
-    indicator.position.set(1.56, 0.82 - i * 0.58 + 0.1, 1.76);
-    groups.television.add(indicator);
-  }
-
-  const footGeometry = new THREE.CylinderGeometry(0.18, 0.25, 0.46, 12);
-  for (const x of [-1.55, 1.45]) {
-    const foot = new THREE.Mesh(footGeometry, darkMaterial);
-    foot.position.set(x, -1.45, 0.54);
-    foot.rotation.z = x < 0 ? -0.12 : 0.12;
-    groups.television.add(foot);
-  }
-
-  const antennaMat = new THREE.MeshStandardMaterial({ color: 0xcbd5d1, metalness: 0.7, roughness: 0.2 });
-  for (const side of [-1, 1]) {
-    const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 2.5, 12), antennaMat);
-    antenna.position.set(side * 0.55, 2.25, -0.4);
-    antenna.rotation.z = side * 0.58;
-    groups.television.add(antenna);
-  }
-}
-
-function buildInternals() {
-  const tube = new THREE.Mesh(createTubeFunnelGeometry(), glassMaterial.clone());
-  tube.material.opacity = 0.23;
-  tube.material.emissiveIntensity = 0.08;
-  tube.rotation.y = Math.PI / 2;
-  tube.position.set(-0.45, 0.28, 0.24);
-  groups.internals.add(tube);
-
-  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 1.05, 36), glassMaterial.clone());
-  neck.material.opacity = 0.28;
-  neck.rotation.x = Math.PI / 2;
-  neck.position.set(-0.45, 0.28, -0.94);
-  groups.internals.add(neck);
-
-  const gunGroup = new THREE.Group();
-  const cathode = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.36, 24), brassMaterial);
-  cathode.rotation.x = Math.PI / 2;
-  cathode.position.z = -1.52;
-  gunGroup.add(cathode);
-
-  const heater = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.015, 8, 40), amberMaterial);
-  heater.position.z = -1.3;
-  heater.rotation.x = Math.PI / 2;
-  gunGroup.add(heater);
-
-  const focus = new THREE.Mesh(new THREE.CylinderGeometry(0.23, 0.23, 0.14, 28), darkMaterial);
-  focus.rotation.x = Math.PI / 2;
-  focus.position.z = -1.02;
-  gunGroup.add(focus);
-
-  gunGroup.position.set(-0.45, 0.28, 0);
-  gunGroup.name = '电子枪';
-  groups.internals.add(gunGroup);
-
-  const yoke = new THREE.Group();
-  const coilA = createCoil(0x66d8f0, 0);
-  const coilB = createCoil(0xf2b15e, Math.PI / 2);
-  yoke.add(coilA, coilB);
-  yoke.position.set(-0.45, 0.28, -0.53);
-  groups.coils.add(yoke);
-
-  const board = new THREE.Mesh(
-    new RoundedBoxGeometry(1.55, 0.92, 0.08, 3, 0.03),
-    new THREE.MeshStandardMaterial({ color: 0x173e37, roughness: 0.76, metalness: 0.05 }),
-  );
-  board.position.set(1.05, -0.58, -0.7);
-  board.rotation.x = -0.18;
-  groups.internals.add(board);
-
-  for (let i = 0; i < 8; i += 1) {
-    const component = new THREE.Mesh(
-      new THREE.BoxGeometry(0.12 + (i % 3) * 0.05, 0.11, 0.16),
-      new THREE.MeshStandardMaterial({
-        color: [0x55706b, 0xc89447, 0x1f86a1][i % 3],
-        roughness: 0.58,
-      }),
-    );
-    component.position.set(0.47 + (i % 4) * 0.28, -0.48 - Math.floor(i / 4) * 0.2, -0.58);
-    groups.internals.add(component);
-  }
-}
-
-function createTubeFunnelGeometry() {
-  const points = [
-    new THREE.Vector2(0.22, -1.25),
-    new THREE.Vector2(0.31, -0.86),
-    new THREE.Vector2(0.78, -0.2),
-    new THREE.Vector2(1.04, 0.35),
-    new THREE.Vector2(1.08, 0.78),
-  ];
-  return new THREE.LatheGeometry(points, 48);
-}
-
-function createCoil(color, rotation) {
-  const coil = new THREE.Group();
-  const material = new THREE.MeshStandardMaterial({
-    color,
-    roughness: 0.2,
-    metalness: 0.42,
-    emissive: color,
-    emissiveIntensity: 0.08,
+function configureShadows(root) {
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    const transparent = mats.some((mat) => mat.transparent || mat.alphaMap);
+    obj.castShadow = !transparent;
+    obj.receiveShadow = true;
   });
-  for (let i = 0; i < 4; i += 1) {
-    const torus = new THREE.Mesh(new THREE.TorusGeometry(0.47 + i * 0.035, 0.018, 12, 70), material);
-    torus.rotation.y = Math.PI / 2;
-    torus.rotation.z = rotation;
-    torus.scale.x = 0.68;
-    coil.add(torus);
+}
+
+function registerParts() {
+  const info = [
+    [cabinet.parts.sleeve, '胡桃木外壳', '木质机箱贴胡桃木皮，外罩清漆；剖开后可见内部结构'],
+    [cabinet.parts.bezel, '前面框', '塑料面框，开口斜面与显像管球面玻屏贴合'],
+    [cabinet.parts.controls, '控制面板', '拉丝铝面板：频道选择、音量、亮度、对比度、电源'],
+    [cabinet.parts.speaker, '扬声器', '纸盆椭圆扬声器，伴音中频解调后推动'],
+    [cabinet.parts.back, '后盖', '带散热槽的塑料后盖，贴有高压警告'],
+    [cabinet.parts.antenna, '拉杆天线', '接收 VHF 电视信号，经 300Ω 扁馈线送入高频头'],
+    [crt.parts.screen, '荧光屏', '内壁涂荧光粉，电子撞击处发光并有短暂余辉'],
+    [crt.parts.tube, '显像管', '真空玻壳，锥体外涂石墨导电层，阳极帽接约 12 kV 高压'],
+    [crt.parts.gun, '电子枪', '灯丝加热阴极发射电子，栅极控制束流，聚焦极把电子束会聚成细点'],
+    [crt.parts.yoke, '偏转线圈', '行线圈（鞍形）与场线圈（环形）产生磁场，使电子束水平、垂直偏转'],
+    [chassis.parts.tuner, '高频调谐器', '选出所需频道并变频为中频'],
+    [chassis.parts.ifStrip, '中频放大', '中周变压器组成的中频放大与视频检波'],
+    [chassis.parts.flyback, '行输出变压器', '产生行扫描锯齿电流，并升压供给显像管阳极'],
+    [chassis.parts.transformer, '电源变压器', '把 220V 市电降压后整流滤波'],
+    [chassis.parts.heatsink, '散热片', '功率管（场输出、稳压）散热'],
+    [chassis.parts.board, '主电路板', '酚醛纸基印制板，承载视频、同步分离、扫描电路'],
+  ];
+  const list = [];
+  for (const [object, title, body] of info) {
+    if (!object) continue;
+    object.userData.partInfo = { title, body };
+    list.push(object);
   }
-  return coil;
+  return list;
 }
 
 function buildSignalFlow() {
+  const tunerPos = new THREE.Vector3(PANEL_LAYOUT.channel.x, PANEL_LAYOUT.channel.y, 0.6);
   const points = [
-    new THREE.Vector3(-1.2, 2.56, -0.36),
-    new THREE.Vector3(-0.15, 1.88, -0.55),
-    new THREE.Vector3(0.95, 0.05, -0.68),
-    new THREE.Vector3(-0.45, 0.28, -1.22),
-    new THREE.Vector3(-0.45, 0.28, 1.58),
+    new THREE.Vector3(-0.95, CAB.top + 0.35, -0.18),
+    tunerPos,
+    new THREE.Vector3(0.05, PCB.y + 0.25, 0.02),
+    new THREE.Vector3(SX, SY, GUN.cathodeZ),
+    new THREE.Vector3(SX, SY, YOKE.centerZ),
+    new THREE.Vector3(SX, SY, faceZ(SX, SY) - 0.05),
   ];
 
   const material = new THREE.LineBasicMaterial({
     color: 0x73f6b4,
     transparent: true,
-    opacity: 0.54,
-    linewidth: 2,
+    opacity: 0.55,
+    depthTest: false,
   });
-
+  const curvePoints = [];
   for (let i = 0; i < points.length - 1; i += 1) {
-    const curve = new THREE.CatmullRomCurve3([points[i], points[i].clone().lerp(points[i + 1], 0.5), points[i + 1]]);
-    const geometry = new THREE.BufferGeometry().setFromPoints(curve.getPoints(38));
-    groups.signals.add(new THREE.Line(geometry, material));
+    const mid = points[i].clone().lerp(points[i + 1], 0.5);
+    if (i < 2) mid.y += 0.25;
+    const curve = new THREE.QuadraticBezierCurve3(points[i], mid, points[i + 1]);
+    const pts = curve.getPoints(40);
+    curvePoints.push(pts);
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), material);
+    line.renderOrder = 10;
+    groups.signals.add(line);
   }
+  groups.signals.userData.paths = curvePoints;
 
-  const pulseGeometry = new THREE.SphereGeometry(0.06, 18, 18);
-  for (let i = 0; i < 6; i += 1) {
-    const pulse = new THREE.Mesh(pulseGeometry, cyanMaterial.clone());
-    pulse.userData.path = points;
-    pulse.userData.offset = i / 6;
+  const pulseGeometry = new THREE.SphereGeometry(0.045, 16, 16);
+  for (let i = 0; i < 8; i += 1) {
+    const pulse = new THREE.Mesh(
+      pulseGeometry,
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(0x66d8f0).multiplyScalar(2.5),
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+      }),
+    );
+    pulse.renderOrder = 11;
+    pulse.userData.offset = i / 8;
+    pulse.userData.pulse = true;
     groups.signals.add(pulse);
   }
 
-  const stagePositions = [
-    new THREE.Vector3(-1.2, 2.3, -0.36),
-    new THREE.Vector3(0.95, -0.22, -0.68),
-    new THREE.Vector3(-0.45, 0.28, -1.22),
-    new THREE.Vector3(-0.45, 0.28, -0.53),
-    new THREE.Vector3(-0.45, 0.28, 1.58),
-  ];
+  const stageColors = [0x66d8f0, 0xf2b15e, 0x73f6b4, 0xff705d, 0xeafff5];
+  const stagePositions = [points[0], points[1], points[2], points[3], points[4]];
   for (let i = 0; i < stagePositions.length; i += 1) {
     const marker = new THREE.Mesh(
-      new THREE.SphereGeometry(0.075, 18, 18),
+      new THREE.SphereGeometry(0.06, 18, 18),
       new THREE.MeshBasicMaterial({
-        color: [0x66d8f0, 0xf2b15e, 0x73f6b4, 0xff705d, 0xeafff5][i],
+        color: new THREE.Color(stageColors[i]).multiplyScalar(2),
         transparent: true,
         opacity: 0.9,
-        blending: THREE.AdditiveBlending,
+        depthTest: false,
       }),
     );
+    marker.renderOrder = 12;
     marker.position.copy(stagePositions[i]);
     marker.userData.stageMarker = true;
     marker.userData.stageIndex = i;
@@ -395,11 +230,11 @@ function buildSignalFlow() {
 }
 
 function buildLabels() {
-  addLabel('天线接收', '把无线电波转成微弱电信号', new THREE.Vector3(-1.55, 2.45, -0.4));
-  addLabel('调谐与放大', '选台后放大图像和同步信号', new THREE.Vector3(1.15, -0.4, -0.72));
-  addLabel('电子枪', '阴极受热后发射电子束', new THREE.Vector3(1.02, 0.96, -1.22));
-  addLabel('偏转线圈', '磁场让电子束水平、垂直偏转', new THREE.Vector3(-1.15, 0.9, -0.52));
-  addLabel('荧光屏', '电子撞击荧光粉形成亮点和余辉', new THREE.Vector3(-1.42, 1.25, 1.75));
+  addLabel('天线接收', '把无线电波转成微弱电信号', new THREE.Vector3(-1.75, CAB.top + 0.7, -0.25));
+  addLabel('调谐与放大', '高频头选台，中放检波得到视频', new THREE.Vector3(2.15, 1.3, 0.55));
+  addLabel('电子枪', '阴极受热后发射电子束', new THREE.Vector3(SX + 0.75, SY + 0.2, -2.25));
+  addLabel('偏转线圈', '磁场让电子束水平、垂直偏转', new THREE.Vector3(SX - 0.35, SY + 1.3, YOKE.centerZ - 0.2));
+  addLabel('荧光屏', '电子撞击荧光粉形成亮点和余辉', new THREE.Vector3(SX - 1.25, SY + 1.25, 1.3));
 }
 
 function addLabel(title, body, position) {
@@ -412,28 +247,24 @@ function addLabel(title, body, position) {
 
 function createScreenTexture() {
   const textureCanvas = document.createElement('canvas');
-  textureCanvas.width = 512;
-  textureCanvas.height = 360;
-  const ctx = textureCanvas.getContext('2d', { willReadFrequently: true });
+  textureCanvas.width = testCard.width;
+  textureCanvas.height = testCard.height;
+  const ctx = textureCanvas.getContext('2d');
+  // 参考画面：测试卡按 P4 白色荧光粉着色
   const reference = document.createElement('canvas');
   reference.width = textureCanvas.width;
   reference.height = textureCanvas.height;
   const referenceCtx = reference.getContext('2d');
-  const image = referenceCtx.createImageData(reference.width, reference.height);
-  for (let y = 0; y < reference.height; y += 1) {
-    for (let x = 0; x < reference.width; x += 1) {
-      const signal = sampleVideoSignal(x / reference.width, y / reference.height);
-      const index = (y * reference.width + x) * 4;
-      image.data[index] = 34 + signal * 80;
-      image.data[index + 1] = 80 + signal * 170;
-      image.data[index + 2] = 72 + signal * 104;
-      image.data[index + 3] = 255;
-    }
-  }
-  referenceCtx.putImageData(image, 0, 0);
+  referenceCtx.drawImage(testCard.canvas, 0, 0);
+  referenceCtx.globalCompositeOperation = 'multiply';
+  referenceCtx.fillStyle = 'rgb(214, 228, 255)';
+  referenceCtx.fillRect(0, 0, reference.width, reference.height);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, textureCanvas.width, textureCanvas.height);
   const texture = new THREE.CanvasTexture(textureCanvas);
   texture.colorSpace = THREE.SRGBColorSpace;
-  return { canvas: textureCanvas, ctx, texture, reference, decay: 0.88 };
+  texture.anisotropy = 8;
+  return { canvas: textureCanvas, ctx, texture, reference };
 }
 
 function createScopes() {
@@ -452,26 +283,48 @@ function getScope(id) {
 }
 
 function createBeamObjects() {
-  const geometry = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(-0.45, 0.28, -1.38),
-    new THREE.Vector3(-0.45, 0.28, 1.58),
-  ]);
-  beamLine = new THREE.Line(geometry, redBeamMaterial);
-  groups.beam.add(beamLine);
+  const coreMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(1.0, 0.42, 0.33).multiplyScalar(5),
+    transparent: true,
+    opacity: 0.95,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const haloMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(1.0, 0.36, 0.28).multiplyScalar(1.2),
+    transparent: true,
+    opacity: 0.22,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const core = new THREE.Mesh(new THREE.BufferGeometry(), coreMat);
+  const halo = new THREE.Mesh(new THREE.BufferGeometry(), haloMat);
+  core.renderOrder = 5;
+  halo.renderOrder = 5;
+  groups.beam.add(core, halo);
 
-  beamGlow = new THREE.Mesh(
-    new THREE.SphereGeometry(0.045, 18, 18),
+  const spot = new THREE.Mesh(
+    new THREE.SphereGeometry(0.03, 16, 16),
     new THREE.MeshBasicMaterial({
-      color: 0xff806f,
+      color: new THREE.Color(0.85, 0.92, 1.0).multiplyScalar(6),
       transparent: true,
-      opacity: 0.92,
       blending: THREE.AdditiveBlending,
+      depthWrite: false,
     }),
   );
-  groups.beam.add(beamGlow);
+  groups.beam.add(spot);
 
-  scanSpot = new THREE.PointLight(0xff705d, 1.8, 2.2);
-  groups.beam.add(scanSpot);
+  const light = new THREE.PointLight(0xbcd2ff, 1.5, 2.6, 2);
+  groups.beam.add(light);
+  return { core, halo, coreMat, haloMat, spot, light };
+}
+
+function createTooltip() {
+  const el = document.createElement('div');
+  el.className = 'part-tip';
+  el.style.display = 'none';
+  document.querySelector('#app').appendChild(el);
+  return el;
 }
 
 function buildUI() {
@@ -489,7 +342,7 @@ function buildUI() {
     button.addEventListener('click', () => setMode(button.dataset.mode));
   }
 
-  bindCheckbox('#shellTransparent', 'shellTransparent');
+  bindCheckbox('#shellOpen', 'shellOpen');
   bindCheckbox('#beamVisible', 'beamVisible');
   bindCheckbox('#coilVisible', 'coilVisible');
   bindCheckbox('#signalVisible', 'signalVisible');
@@ -498,7 +351,11 @@ function buildUI() {
   bindRange('#noise', 'noise');
 
   window.addEventListener('resize', onResize);
-  window.addEventListener('pointermove', onPointerMove);
+  renderer.domElement.addEventListener('pointermove', onPointerMove);
+  renderer.domElement.addEventListener('pointerleave', () => {
+    pointer.set(-10, -10);
+    pointerClient.moved = true;
+  });
 }
 
 function setIcon(selector, icon) {
@@ -519,43 +376,47 @@ function bindRange(selector, key) {
   });
 }
 
+const cameraTargets = {
+  overview: { position: [5.9, 2.9, 7.6], target: [0.55, 0.25, -0.3] },
+  inside: { position: [4.3, 4.7, -1.75], target: [-0.3, 0.05, -0.45] },
+  signal: { position: [5.9, 5.0, 5.2], target: [0.45, 0.4, -0.45] },
+  screen: { position: [SX + 0.85, SY + 0.12, 6.0], target: [SX + 0.85, SY, 0.9] },
+};
+
 function setMode(mode, force = false) {
   state.mode = mode;
   for (const button of document.querySelectorAll('.mode-button')) {
     button.classList.toggle('is-active', button.dataset.mode === mode);
   }
 
-  const cameraTargets = {
-    overview: { position: [6.6, 3.3, 7.8], target: [0, 0.6, 0] },
-    inside: { position: [3.65, 2.15, 4.55], target: [-0.34, 0.24, -0.08] },
-    signal: { position: [4.85, 2.55, 5.75], target: [-0.32, 0.62, 0.1] },
-    screen: { position: [-0.55, 0.38, 5.18], target: [-0.45, 0.28, 1.42] },
-  };
+  if (mode === 'inside' || mode === 'signal') {
+    state.shellOpen = true;
+  } else if (mode === 'screen' || mode === 'overview') {
+    state.shellOpen = false;
+  }
+  document.querySelector('#shellOpen').checked = state.shellOpen;
+  state.signalVisible = mode === 'signal';
+  document.querySelector('#signalVisible').checked = state.signalVisible;
+  if (force) state.open = state.shellOpen ? 1 : 0;
+
   const next = cameraTargets[mode];
   if (force) {
     camera.position.fromArray(next.position);
     controls.target.fromArray(next.target);
+    camera.userData.destination = null;
     controls.update();
-    return;
-  }
-  camera.userData.destination = {
-    position: new THREE.Vector3().fromArray(next.position),
-    target: new THREE.Vector3().fromArray(next.target),
-  };
-
-  if (mode === 'inside' || mode === 'signal') {
-    state.shellTransparent = true;
-    document.querySelector('#shellTransparent').checked = true;
+  } else {
+    camera.userData.destination = {
+      position: new THREE.Vector3().fromArray(next.position),
+      target: new THREE.Vector3().fromArray(next.target),
+    };
   }
   applyVisibility();
 }
 
 function applyVisibility() {
-  shellMaterial.opacity = state.shellTransparent ? 0.38 : 1;
-  shellMaterial.transparent = state.shellTransparent;
-  groups.internals.visible = state.shellTransparent || state.mode === 'inside';
-  groups.beam.visible = state.beamVisible && groups.internals.visible;
-  groups.coils.visible = state.coilVisible && groups.internals.visible;
+  groups.beam.visible = state.beamVisible;
+  crt.parts.yoke.visible = state.coilVisible;
   groups.signals.visible = state.signalVisible;
   labelLayer.style.display = state.signalVisible ? 'block' : 'none';
 }
@@ -566,11 +427,30 @@ function onResize() {
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
   renderer.setSize(width, height);
+  composer.setSize(width, height);
+  bloom.setSize(width, height);
 }
 
 function onPointerMove(event) {
   pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
   pointer.y = -(event.clientY / window.innerHeight) * 2 + 1;
+  pointerClient.x = event.clientX;
+  pointerClient.y = event.clientY;
+  pointerClient.moved = true;
+}
+
+function updateOpen(delta) {
+  const target = state.shellOpen ? 1 : 0;
+  const speed = 1.6;
+  if (state.open < target) state.open = Math.min(target, state.open + delta * speed);
+  else if (state.open > target) state.open = Math.max(target, state.open - delta * speed);
+  const k = smoothstep(0, 1, state.open);
+  // 剖切面从远处扫入，看起来像外壳被切开
+  cutPlanes[0].constant = CUT_FAR + (CUT_X - CUT_FAR) * k;
+  cutPlanes[1].constant = CUT_FAR + (CUT_Y - CUT_FAR) * k;
+  stage.interior.intensity = k * 1.2;
+  // 外壳闭合时电子束看不到，顺便省去绘制
+  groups.beam.visible = state.beamVisible && k > 0.02;
 }
 
 function updateScreen(delta) {
@@ -578,11 +458,12 @@ function updateScreen(delta) {
   const width = textureCanvas.width;
   const height = textureCanvas.height;
 
+  // 荧光粉余辉衰减 + 残留画面
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
-  ctx.fillStyle = 'rgba(2, 13, 9, 0.045)';
+  ctx.fillStyle = 'rgba(3, 4, 6, 0.05)';
   ctx.fillRect(0, 0, width, height);
-  ctx.globalAlpha = 0.12 * state.brightness;
+  ctx.globalAlpha = 0.11 * state.brightness;
   ctx.drawImage(reference, 0, 0);
   ctx.globalAlpha = 1;
 
@@ -597,88 +478,86 @@ function updateScreen(delta) {
   const x = lineProgress * width;
   const y = ((currentLine % lineCount) / (lineCount - 1)) * height;
 
-  ctx.fillStyle = `rgba(115, 246, 180, ${0.08 * state.brightness})`;
-  for (let scanY = 0; scanY < height; scanY += 4) {
+  // 扫描线间隙
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.07)';
+  for (let scanY = 0; scanY < height; scanY += 3) {
     ctx.fillRect(0, scanY, width, 1);
   }
 
   ctx.globalCompositeOperation = 'lighter';
-  for (let px = 0; px <= x; px += 2.6) {
-    const u = px / width;
-    const v = y / height;
-    const value = sampleVideoSignal(u, v);
-    const green = Math.round(78 + value * 168 * state.brightness);
-    const alpha = 0.2 + value * 0.6 * state.brightness;
-    ctx.fillStyle = `rgba(108, ${green}, 176, ${alpha})`;
-    ctx.fillRect(px, y - 1.2, 3.6, 2.4);
+  for (let px = 0; px <= x; px += 2.5) {
+    const value = sampleVideoSignal(px / width, y / height);
+    const a = (0.12 + value * 0.7) * state.brightness;
+    ctx.fillStyle = `rgba(${Math.round(150 + value * 90)}, ${Math.round(160 + value * 90)}, 255, ${a})`;
+    ctx.fillRect(px, y - 1.4, 3.2, 2.8);
   }
 
   const rawSignal = sampleVideoSignal(x / width, y / height);
   const signal = clamp(rawSignal + (Math.random() - 0.5) * state.noise * 0.65, 0, 1);
   const jitter = (Math.random() - 0.5) * width * state.noise * 0.4;
-  const gradient = ctx.createRadialGradient(x + jitter, y, 3, x + jitter, y, 92);
-  gradient.addColorStop(0, `rgba(235, 255, 235, ${0.35 + 0.65 * signal * state.brightness})`);
-  gradient.addColorStop(0.2, `rgba(115, 246, 180, ${0.18 + 0.65 * state.brightness * signal})`);
-  gradient.addColorStop(1, 'rgba(115, 246, 180, 0)');
+  const gradient = ctx.createRadialGradient(x + jitter, y, 2, x + jitter, y, 60);
+  gradient.addColorStop(0, `rgba(245, 250, 255, ${0.4 + 0.6 * signal * state.brightness})`);
+  gradient.addColorStop(0.25, `rgba(170, 195, 255, ${0.15 + 0.4 * state.brightness * signal})`);
+  gradient.addColorStop(1, 'rgba(150, 180, 255, 0)');
   ctx.fillStyle = gradient;
   ctx.beginPath();
-  ctx.arc(x + jitter, y, 96, 0, Math.PI * 2);
+  ctx.arc(x + jitter, y, 62, 0, Math.PI * 2);
   ctx.fill();
 
-  ctx.strokeStyle = `rgba(235, 255, 235, ${0.78 * state.brightness})`;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(0, y);
-  ctx.lineTo(x + jitter, y);
-  ctx.stroke();
-
-  for (let i = 0; i < Math.round(30 * state.noise); i += 1) {
-    ctx.fillStyle = `rgba(255, 255, 255, ${Math.random() * 0.25})`;
+  for (let i = 0; i < Math.round(60 * state.noise); i += 1) {
+    ctx.fillStyle = `rgba(230, 235, 255, ${Math.random() * 0.3})`;
     ctx.fillRect(Math.random() * width, Math.random() * height, 1 + Math.random() * 4, 1);
   }
+  ctx.globalCompositeOperation = 'source-over';
 
   texture.needsUpdate = true;
+  materials.screen.emissiveIntensity = 0.62 + state.brightness * 0.38;
+  stage.screenLight.intensity = 1.6 + state.brightness * 2.2;
 
-  const sx = (x / width - 0.5) * 2.42;
-  const sy = -(y / height - 0.5) * 1.62;
-  updateBeam(sx - 0.45, sy + 0.28, x / width, y / height, signal);
-  updateScopes(x / width, y / height, signal, currentLine, lineCount);
-  updateConversionReadout(x / width, y / height, signal);
-}
-
-function sampleVideoSignal(u, v) {
-  const border = u < 0.045 || u > 0.955 || v < 0.06 || v > 0.94 ? 0.8 : 0.08;
-  const bars = v < 0.22 ? 0.18 + (Math.floor(u * 7) % 2) * 0.58 + u * 0.18 : 0;
-  const dx = u - 0.5;
-  const dy = (v - 0.52) * 1.35;
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  const circle = Math.abs(dist - 0.27) < 0.025 ? 0.95 : 0;
-  const center = dist < 0.17 ? 0.48 + 0.32 * Math.sin(u * Math.PI * 8) : 0;
-  const diagonal = Math.abs(v - (0.82 - u * 0.42)) < 0.018 ? 0.88 : 0;
-  const block = u > 0.12 && u < 0.32 && v > 0.58 && v < 0.82 ? 0.68 : 0;
-  const stair = u > 0.64 && u < 0.86 && v > 0.42 && v < 0.75 ? (Math.floor((v - 0.42) * 18) % 2 ? 0.3 : 0.82) : 0;
-  return clamp(Math.max(border, bars, circle, center, diagonal, block, stair), 0.04, 1);
+  const u = x / width;
+  const v = y / height;
+  updateBeam(u, v, signal);
+  updateScopes(u, v, signal, currentLine, lineCount);
+  updateConversionReadout(u, v, signal);
 }
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function updateBeam(screenX, screenY, horizontal, vertical, signal) {
-  const start = new THREE.Vector3(-0.45, 0.28, -1.38);
-  const control = new THREE.Vector3(-0.45 + (screenX + 0.45) * 0.22, 0.28 + (screenY - 0.28) * 0.22, -0.25);
-  const end = new THREE.Vector3(screenX, screenY, 1.57);
-  const curve = new THREE.QuadraticBezierCurve3(start, control, end);
-  beamLine.geometry.setFromPoints(curve.getPoints(30));
-  redBeamMaterial.opacity = 0.32 + signal * 0.68;
-  beamGlow.position.copy(end);
-  beamGlow.scale.setScalar(0.7 + signal * 1.45);
-  scanSpot.position.copy(end);
-  scanSpot.intensity = 0.55 + signal * 2.4;
+const beamPoints = [];
+function updateBeam(u, v, signal) {
+  const tx = SX + (u - 0.5) * 2 * RASTER.halfW;
+  const ty = SY - (v - 0.5) * 2 * RASTER.halfH;
+  const target = new THREE.Vector3(tx, ty, faceZ(tx, ty) - 0.05);
 
-  document.querySelector('#horizontalMeter').style.width = `${horizontal * 100}%`;
-  document.querySelector('#verticalMeter').style.width = `${vertical * 100}%`;
-  document.querySelector('#videoMeter').style.width = `${signal * 100}%`;
+  // 沿轴线直行 → 在偏转线圈内弯折 → 直线射向荧光屏
+  const start = new THREE.Vector3(SX, SY, GUN.exitZ);
+  const entry = new THREE.Vector3(SX, SY, YOKE.backZ + 0.08);
+  const center = new THREE.Vector3(SX, SY, YOKE.centerZ);
+  const dir = target.clone().sub(center);
+  const exit = center.clone().addScaledVector(dir, (YOKE.frontZ + 0.05 - YOKE.centerZ) / dir.z);
+  const bend = new THREE.QuadraticBezierCurve3(entry, center, exit);
+  beamPoints.length = 0;
+  beamPoints.push(start);
+  for (let i = 0; i <= 10; i += 1) beamPoints.push(bend.getPoint(i / 10));
+  for (let i = 1; i <= 8; i += 1) beamPoints.push(exit.clone().lerp(target, i / 8));
+  const path = new THREE.CatmullRomCurve3(beamPoints);
+
+  beam.core.geometry.dispose();
+  beam.halo.geometry.dispose();
+  beam.core.geometry = new THREE.TubeGeometry(path, 48, 0.006 + signal * 0.004, 6);
+  beam.halo.geometry = new THREE.TubeGeometry(path, 48, 0.022 + signal * 0.012, 8);
+  beam.coreMat.opacity = 0.35 + signal * 0.65;
+  beam.haloMat.opacity = 0.08 + signal * 0.2;
+  beam.spot.position.copy(target);
+  beam.spot.scale.setScalar(0.6 + signal * 1.3);
+  beam.light.position.copy(target).add(new THREE.Vector3(0, 0, -0.15));
+  beam.light.intensity = 0.4 + signal * 2.2;
+
+  meters.horizontal.style.width = `${u * 100}%`;
+  meters.vertical.style.width = `${v * 100}%`;
+  meters.video.style.width = `${signal * 100}%`;
 }
 
 function updateScopes(horizontal, vertical, signal, currentLine, lineCount) {
@@ -796,22 +675,17 @@ function drawScreenPreview(scope, horizontal, vertical) {
   scopeCtx.fillStyle = 'rgba(2, 13, 9, 0.98)';
   scopeCtx.fillRect(0, 0, w, h);
 
-  const imageW = w - 8;
   const imageH = h - 8;
-  const offsetX = 4;
+  const imageW = Math.round(imageH * (4 / 3));
+  const offsetX = Math.round((w - imageW) / 2);
   const offsetY = 4;
-  for (let y = 0; y < imageH; y += 2) {
-    for (let x = 0; x < imageW; x += 2) {
-      const value = sampleVideoSignal(x / imageW, y / imageH);
-      const green = Math.round(58 + value * 190);
-      scopeCtx.fillStyle = `rgba(80, ${green}, 144, ${0.5 + value * 0.42})`;
-      scopeCtx.fillRect(offsetX + x, offsetY + y, 2, 2);
-    }
-  }
+  scopeCtx.globalAlpha = 0.9;
+  scopeCtx.drawImage(screenTexture.reference, offsetX, offsetY, imageW, imageH);
+  scopeCtx.globalAlpha = 1;
 
   const beamX = offsetX + horizontal * imageW;
   const beamY = offsetY + vertical * imageH;
-  scopeCtx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+  scopeCtx.strokeStyle = 'rgba(255, 112, 93, 0.75)';
   scopeCtx.lineWidth = 1;
   scopeCtx.beginPath();
   scopeCtx.moveTo(offsetX, beamY);
@@ -821,9 +695,9 @@ function drawScreenPreview(scope, horizontal, vertical) {
   scopeCtx.stroke();
 
   const signal = sampleVideoSignal(horizontal, vertical);
-  scopeCtx.fillStyle = `rgba(235, 255, 235, ${0.65 + signal * 0.35})`;
+  scopeCtx.fillStyle = `rgba(255, 140, 120, ${0.65 + signal * 0.35})`;
   scopeCtx.beginPath();
-  scopeCtx.arc(beamX, beamY, 3.2 + signal * 3, 0, Math.PI * 2);
+  scopeCtx.arc(beamX, beamY, 3 + signal * 2.5, 0, Math.PI * 2);
   scopeCtx.fill();
   scopeCtx.strokeStyle = 'rgba(115, 246, 180, 0.85)';
   scopeCtx.strokeRect(offsetX + 0.5, offsetY + 0.5, imageW - 1, imageH - 1);
@@ -839,51 +713,52 @@ function drawScopeCursor(scopeCtx, w, h, progress) {
   scopeCtx.stroke();
 }
 
+const stepNames = ['receive', 'demod', 'video', 'sync', 'paint'];
+const stepElements = [...document.querySelectorAll('.step')];
+const explainText = document.querySelector('#explainText');
 function updateConversionReadout(horizontal, vertical, signal) {
-  const stepNames = ['receive', 'demod', 'video', 'sync', 'paint'];
   const index = Math.min(stepNames.length - 1, Math.floor((state.scan * stepNames.length * 1.7) % stepNames.length));
-  for (const step of document.querySelectorAll('.step')) {
+  for (const step of stepElements) {
     step.classList.toggle('is-active', step.dataset.step === stepNames[index]);
   }
 
   const syncText = horizontal < 0.08 || vertical < 0.035 ? '同步脉冲正在校准扫描起点' : '亮度信号正在调制电子束强弱';
-  document.querySelector('#explainText').textContent =
+  explainText.textContent =
     `当前位置 x=${Math.round(horizontal * 100)}%, y=${Math.round(vertical * 100)}%；视频亮度=${Math.round(signal * 100)}%。${syncText}，屏幕上对应亮点随之变亮或变暗。`;
 }
 
 function updateSignals(elapsed) {
-  const pulses = groups.signals.children.filter((child) => child.isMesh && child.userData.path);
-  for (const pulse of pulses) {
-    const path = pulse.userData.path;
-    const t = (elapsed * 0.16 + pulse.userData.offset) % 1;
-    const scaled = t * (path.length - 1);
-    const index = Math.min(path.length - 2, Math.floor(scaled));
-    const local = scaled - index;
-    pulse.position.copy(path[index]).lerp(path[index + 1], local);
-    pulse.scale.setScalar(0.72 + Math.sin((t + pulse.userData.offset) * Math.PI * 2) * 0.22);
-  }
-
-  const activeStage = Math.floor((state.scan * 5 * 1.7) % 5);
-  const markers = groups.signals.children.filter((child) => child.userData.stageMarker);
-  for (const marker of markers) {
-    const isActive = marker.userData.stageIndex === activeStage;
-    marker.scale.setScalar(isActive ? 1.75 + Math.sin(elapsed * 8) * 0.18 : 1);
-    marker.material.opacity = isActive ? 1 : 0.46;
-  }
-
-  for (let i = 0; i < groups.coils.children.length; i += 1) {
-    groups.coils.children[i].rotation.z = Math.sin(elapsed * 1.8 + i) * 0.05;
+  const paths = groups.signals.userData.paths;
+  const total = paths.length;
+  for (const child of groups.signals.children) {
+    if (child.userData.pulse) {
+      const t = (elapsed * 0.12 + child.userData.offset) % 1;
+      const scaled = t * total;
+      const seg = Math.min(total - 1, Math.floor(scaled));
+      const pts = paths[seg];
+      const local = (scaled - seg) * (pts.length - 1);
+      const i = Math.min(pts.length - 2, Math.floor(local));
+      child.position.copy(pts[i]).lerp(pts[i + 1], local - i);
+      child.scale.setScalar(0.75 + Math.sin((t + child.userData.offset) * Math.PI * 2) * 0.2);
+    } else if (child.userData.stageMarker) {
+      const activeStage = Math.floor((state.scan * 5 * 1.7) % 5);
+      const isActive = child.userData.stageIndex === activeStage;
+      child.scale.setScalar(isActive ? 1.7 + Math.sin(elapsed * 8) * 0.18 : 1);
+      child.material.opacity = isActive ? 1 : 0.45;
+    }
   }
 }
 
 function updateLabels() {
+  const width = window.innerWidth;
+  const height = window.innerHeight;
   for (const label of labels) {
     const pos = label.position.clone().project(camera);
     const visible = pos.z > -1 && pos.z < 1;
     label.el.style.display = visible ? 'block' : 'none';
     if (!visible) continue;
-    label.el.style.left = `${(pos.x * 0.5 + 0.5) * window.innerWidth}px`;
-    label.el.style.top = `${(-pos.y * 0.5 + 0.5) * window.innerHeight}px`;
+    label.el.style.left = `${(pos.x * 0.5 + 0.5) * width}px`;
+    label.el.style.top = `${(-pos.y * 0.5 + 0.5) * height}px`;
   }
 }
 
@@ -898,28 +773,57 @@ function updateCamera() {
 }
 
 function updateHover() {
-  raycaster.setFromCamera(pointer, camera);
-  const targets = [...groups.television.children, ...groups.internals.children, ...groups.coils.children];
-  const hits = raycaster.intersectObjects(targets, true);
-  if (hovered?.material?.emissive) hovered.material.emissiveIntensity = hovered.userData.baseEmissive ?? 0;
-  hovered = hits[0]?.object ?? null;
-  if (hovered?.material?.emissive) {
-    hovered.userData.baseEmissive = hovered.userData.baseEmissive ?? hovered.material.emissiveIntensity;
-    hovered.material.emissiveIntensity = 0.26;
+  if (!pointerClient.moved || frame % 4 !== 0) return;
+  pointerClient.moved = false;
+  if (pointer.x < -1.5) {
+    tooltip.style.display = 'none';
+    return;
   }
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(pickables, true);
+  let info = null;
+  for (const hit of hits) {
+    const mat = Array.isArray(hit.object.material) ? hit.object.material[0] : hit.object.material;
+    if (mat?.clippingPlanes?.length && cutPlanes.every((p) => p.distanceToPoint(hit.point) < 0)) continue;
+    if (!isVisible(hit.object)) continue;
+    let o = hit.object;
+    while (o && !o.userData.partInfo) o = o.parent;
+    if (o) {
+      info = o.userData.partInfo;
+      break;
+    }
+  }
+  if (!info) {
+    tooltip.style.display = 'none';
+    return;
+  }
+  tooltip.innerHTML = `<strong>${info.title}</strong>${info.body}`;
+  tooltip.style.display = 'block';
+  tooltip.style.left = `${pointerClient.x + 16}px`;
+  tooltip.style.top = `${pointerClient.y + 16}px`;
+}
+
+function isVisible(object) {
+  for (let o = object; o; o = o.parent) if (!o.visible) return false;
+  return true;
 }
 
 function animate() {
-  const delta = Math.min(clock.getDelta(), 0.04);
+  const delta = Math.min(clock.getDelta(), 0.05);
   const elapsed = clock.elapsedTime;
+  frame += 1;
+  updateOpen(delta);
   updateScreen(delta);
   updateSignals(elapsed);
   updateCamera();
-  updateHover();
   controls.update();
+  updateHover();
   updateLabels();
-  renderer.render(scene, camera);
+  composer.render();
   requestAnimationFrame(animate);
 }
 
+setMode('signal', true);
+applyVisibility();
+if (import.meta.env.DEV) window.__tv = { camera, controls, state, setMode, scene };
 animate();
